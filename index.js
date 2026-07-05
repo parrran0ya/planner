@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
+const { DateTime } = require('luxon');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -57,7 +58,7 @@ bot.hears(/^[A-Za-z0-9]{6}$/, async (ctx) => {
   await sb.from('profiles').update({ telegram_chat_id: ctx.chat.id }).eq('id', linkRow.user_id);
   await sb.from('telegram_link_codes').delete().eq('code', code);
 
-  ctx.reply('Готово, аккаунт привязан! Команды: /tasks, /habits, /add текст задачи');
+  ctx.reply('Готово, аккаунт привязан! Команды: /tasks, /habits, /add текст (в «Сегодня»), /later текст (в «Предстоящее»), /remind ЧЧ:ММ текст (напоминание)');
 });
 
 // ---------- Middleware: требуем привязку для остальных команд ----------
@@ -96,13 +97,26 @@ bot.command('add', requireProfile, async (ctx) => {
 
   await sb.from('tasks').insert({
     user_id: ctx.profile.id,
+    column_name: 'today',
+    text,
+    is_private: true,
+  });
+
+  ctx.reply(`Добавил в «Сегодня»: ${text}`);
+});
+
+bot.command('later', requireProfile, async (ctx) => {
+  const text = ctx.message.text.replace(/^\/later(@\w+)?\s*/, '').trim();
+  if (!text) return ctx.reply('Использование: /later купить подарок на день рождения');
+
+  await sb.from('tasks').insert({
+    user_id: ctx.profile.id,
     column_name: 'week',
     text,
     is_private: true,
-    due_date: todayISO(),
   });
 
-  ctx.reply(`Добавил в «Предстоящее»: ${text}`);
+  ctx.reply(`Добавил в «Предстоящее» (без даты — дату можно выставить на сайте): ${text}`);
 });
 
 // ---------- Привычки ----------
@@ -137,12 +151,109 @@ bot.action(/^habit:(.+)$/, async (ctx) => {
   await ctx.editMessageText(`${history[today] ? '✅' : '◻️'} ${habit.name}`);
 });
 
+// ---------- Гибкие напоминания (разовые и повторяющиеся) ----------
+
+function computeNextTrigger(hour, minute, repeatRule) {
+  const now = DateTime.now().setZone(TZ);
+  let dt = now.set({ hour, minute, second: 0, millisecond: 0 });
+  if (dt <= now) {
+    dt = repeatRule === 'weekly' ? dt.plus({ weeks: 1 }) : dt.plus({ days: 1 });
+  }
+  return dt.toUTC().toISO();
+}
+
+bot.command('remind', requireProfile, async (ctx) => {
+  const raw = ctx.message.text.replace(/^\/remind(@\w+)?\s*/, '').trim();
+  const usage =
+    'Использование:\n' +
+    '/remind 18:30 позвонить маме — разово, сегодня или завтра в это время\n' +
+    '/remind daily 08:00 выпить витамины — каждый день\n' +
+    '/remind weekly 19:00 позвонить бабушке — каждую неделю в этот же день недели';
+
+  if (!raw) return ctx.reply(usage);
+
+  let repeatRule = 'none';
+  let rest = raw;
+  if (/^daily\s+/i.test(rest)) { repeatRule = 'daily'; rest = rest.replace(/^daily\s+/i, ''); }
+  else if (/^weekly\s+/i.test(rest)) { repeatRule = 'weekly'; rest = rest.replace(/^weekly\s+/i, ''); }
+
+  const match = rest.match(/^(\d{1,2}):(\d{2})\s+(.+)$/s);
+  if (!match) return ctx.reply(usage);
+
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const text = match[3].trim();
+
+  if (hour > 23 || minute > 59) return ctx.reply('Время указано неверно — используй 24-часовой формат ЧЧ:ММ.');
+
+  const weekday = DateTime.now().setZone(TZ).weekday; // 1 (пн) .. 7 (вс)
+  const nextTrigger = computeNextTrigger(hour, minute, repeatRule);
+  const timeOfDay = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+  await sb.from('bot_reminders').insert({
+    user_id: ctx.profile.id,
+    text,
+    repeat_rule: repeatRule,
+    weekday: repeatRule === 'weekly' ? weekday : null,
+    time_of_day: timeOfDay,
+    next_trigger: nextTrigger,
+  });
+
+  const when = repeatRule === 'none' ? 'разово' : repeatRule === 'daily' ? 'каждый день' : 'каждую неделю';
+  ctx.reply(`Напомню (${when}) в ${timeOfDay}: ${text}`);
+});
+
+bot.command('reminders', requireProfile, async (ctx) => {
+  const { data } = await sb.from('bot_reminders').select('*').eq('user_id', ctx.profile.id).order('next_trigger');
+  if (!data || data.length === 0) return ctx.reply('Активных напоминаний нет.');
+
+  const labels = { none: 'разово', daily: 'ежедневно', weekly: 'еженедельно' };
+  const lines = data.map(r => `#${r.id.slice(0, 6)} — ${r.time_of_day} (${labels[r.repeat_rule]}) — ${r.text}`);
+  ctx.reply(lines.join('\n') + '\n\nУдалить: /delremind код');
+});
+
+bot.command('delremind', requireProfile, async (ctx) => {
+  const code = ctx.message.text.replace(/^\/delremind(@\w+)?\s*/, '').trim().toLowerCase();
+  if (!code) return ctx.reply('Использование: /delremind код (код см. в /reminders)');
+
+  const { data } = await sb.from('bot_reminders').select('id').eq('user_id', ctx.profile.id);
+  const found = (data || []).find(r => r.id.startsWith(code));
+  if (!found) return ctx.reply('Не нашёл напоминание с таким кодом.');
+
+  await sb.from('bot_reminders').delete().eq('id', found.id);
+  ctx.reply('Удалил.');
+});
+
+async function checkReminders() {
+  const nowIso = new Date().toISOString();
+  const { data: due } = await sb
+    .from('bot_reminders')
+    .select('*, profiles!inner(telegram_chat_id)')
+    .lte('next_trigger', nowIso)
+    .not('profiles.telegram_chat_id', 'is', null);
+
+  for (const r of due || []) {
+    const chatId = r.profiles.telegram_chat_id;
+    await bot.telegram.sendMessage(chatId, `⏰ Напоминание: ${r.text}`).catch(() => {});
+
+    if (r.repeat_rule === 'none') {
+      await sb.from('bot_reminders').delete().eq('id', r.id);
+    } else {
+      const prev = DateTime.fromISO(r.next_trigger, { zone: 'utc' });
+      const next = r.repeat_rule === 'weekly' ? prev.plus({ weeks: 1 }) : prev.plus({ days: 1 });
+      await sb.from('bot_reminders').update({ next_trigger: next.toISO() }).eq('id', r.id);
+    }
+  }
+}
+
 // ---------- Напоминания по расписанию ----------
 
 async function morningReminders() {
   const today = todayISO();
   const { data: tasks } = await sb.from('tasks').select('user_id, text, profiles!inner(telegram_chat_id)')
-    .eq('done', false).eq('due_date', today).not('profiles.telegram_chat_id', 'is', null);
+    .eq('done', false)
+    .or(`column_name.eq.today,due_date.eq.${today}`)
+    .not('profiles.telegram_chat_id', 'is', null);
 
   const byChat = {};
   (tasks || []).forEach(t => {
@@ -174,6 +285,7 @@ async function eveningReminders() {
 
 cron.schedule('0 9 * * *', morningReminders, { timezone: TZ });
 cron.schedule('0 21 * * *', eveningReminders, { timezone: TZ });
+cron.schedule('* * * * *', checkReminders, { timezone: TZ });
 
 // ---------- Запуск ----------
 
